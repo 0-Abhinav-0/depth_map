@@ -5,12 +5,19 @@ import torch.nn.functional as F
 from PIL import Image
 
 from .depth_model import disparity_to_depth
+from .motion import MAX_EPIPOLAR_ERROR_PX, epipolar_error_px, essential_matrix
 
 # Pixels closer than this many pixels apart in a Huber loss are treated as
 # "agree" rather than penalized further; keeps a few bad correspondences
 # from dominating the gradient.
 HUBER_DELTA_WORLD = 0.1
 MIN_ANCHORS_FOR_CALIBRATION = 8
+MIN_INLIER_CORRESPONDENCES_PER_PAIR = 16
+# Only judge a frame's reliability once it has enough epipolar-checked
+# samples to be statistically meaningful; a frame touched by only a
+# handful of correspondences gets the benefit of the doubt.
+MIN_SAMPLES_FOR_RELIABILITY_CHECK = 200
+MIN_EPIPOLAR_INLIER_RATE = 0.5
 
 
 def _grid_sample_at(field, uv):
@@ -114,32 +121,81 @@ def refine_depth_sequence(
             t = torch.tensor(geo.t, dtype=torch.float32, device=device)
             poses.append((R, t, geo.fx, geo.fy, geo.cx, geo.cy))
 
-    # Frames COLMAP couldn't register have no anchors, so they were left at
-    # the identity (1.0, 0.0) affine above -- an arbitrary, uncalibrated
-    # scale completely unrelated to the other frames' COLMAP-tied scale.
-    # Left as-is, those frames' depth values land nowhere near the
-    # calibrated frames', which blows out the whole clip's dynamic range
-    # once export.py normalizes against the global min/max. They still
-    # don't get real geometric correction (no pose -> can't join the
-    # consistency loss), but borrowing the nearest registered frame's
-    # (scale, shift) at least puts them on the right order of magnitude so
-    # they don't wreck the shared scale every other frame depends on.
-    calibrated_idxs = [idx for idx in range(n) if anchors[idx] is not None]
-    if calibrated_idxs:
-        for idx in range(n):
-            if anchors[idx] is None:
-                nearest = min(calibrated_idxs, key=lambda c: abs(c - idx))
-                scale_shift[idx] = scale_shift[nearest]
-
+    # Every flow correspondence between two POSED frames is checked against
+    # the epipolar constraint implied by their recovered relative pose: any
+    # STATIC point, at any depth, must satisfy it under rigid camera motion.
+    # A correspondence that violates it isn't an unusual-depth static point
+    # (parallax alone never breaks this constraint) -- it's evidence of a
+    # moving object, or a bad correspondence/pose. Filtering these out here
+    # keeps the consistency loss from being handed contradictory
+    # constraints by e.g. a person moving in the foreground.
     correspondences = []
+    inlier_counts = [0] * n
+    total_counts = [0] * n
     for (i, j), (flow_ij, mask_ij) in flow_results.items():
         if poses[i] is None or poses[j] is None:
             continue
         sampled = _sample_valid_correspondences(flow_ij, mask_ij, max_correspondences_per_pair)
         if sampled is None:
             continue
-        uv_i, uv_j = sampled
-        correspondences.append((i, j, uv_i.to(device), uv_j.to(device)))
+        uv_i, uv_j = sampled[0].to(device), sampled[1].to(device)
+
+        R_i, t_i, fx_i, fy_i, cx_i, cy_i = poses[i]
+        R_j, t_j, fx_j, fy_j, cx_j, cy_j = poses[j]
+        E = essential_matrix(R_i, t_i, R_j, t_j)
+        epi_error = epipolar_error_px(uv_i, uv_j, E, fx_i, fy_i, cx_i, cy_i, fx_j, fy_j, cx_j, cy_j)
+        inlier = epi_error < MAX_EPIPOLAR_ERROR_PX
+
+        total_counts[i] += inlier.numel()
+        total_counts[j] += inlier.numel()
+        inlier_counts[i] += inlier.sum().item()
+        inlier_counts[j] += inlier.sum().item()
+
+        if inlier.sum().item() < MIN_INLIER_CORRESPONDENCES_PER_PAIR:
+            continue
+        correspondences.append((i, j, uv_i[inlier], uv_j[inlier]))
+
+    # A frame whose correspondences are mostly epipolar outliers is either
+    # dominated by a moving subject or was itself badly posed by COLMAP
+    # (e.g. registered via a weak fallback rather than normal PnP) --
+    # either way its own anchors/pose aren't trustworthy either, so it's
+    # pulled out of the anchor loss and every correspondence touching it,
+    # the same as a frame COLMAP never registered at all.
+    unreliable_frames = {
+        idx
+        for idx in range(n)
+        if total_counts[idx] >= MIN_SAMPLES_FOR_RELIABILITY_CHECK
+        and inlier_counts[idx] / total_counts[idx] < MIN_EPIPOLAR_INLIER_RATE
+    }
+    if unreliable_frames:
+        print(
+            f"[refine] flagged {len(unreliable_frames)} frame(s) as unreliable "
+            f"(likely dominated by a moving subject, or a bad COLMAP pose): "
+            f"{[names[idx] for idx in sorted(unreliable_frames)]}"
+        )
+        for idx in unreliable_frames:
+            anchors[idx] = None
+        correspondences = [
+            c for c in correspondences if c[0] not in unreliable_frames and c[1] not in unreliable_frames
+        ]
+
+    # Frames with no anchors -- either COLMAP never registered them, or they
+    # were just flagged unreliable above -- were left at the identity
+    # (1.0, 0.0) affine, an arbitrary scale unrelated to the other frames'
+    # COLMAP-tied scale. Left as-is, their depth values land nowhere near
+    # the calibrated frames', which blows out the whole clip's dynamic
+    # range once export.py normalizes against the global min/max. They
+    # still don't get real geometric correction (no trustworthy pose ->
+    # can't join the consistency loss), but borrowing the nearest reliable
+    # frame's (scale, shift) at least puts them on the right order of
+    # magnitude so they don't wreck the shared scale every other frame
+    # depends on.
+    calibrated_idxs = [idx for idx in range(n) if anchors[idx] is not None]
+    if calibrated_idxs:
+        for idx in range(n):
+            if anchors[idx] is None:
+                nearest = min(calibrated_idxs, key=lambda c: abs(c - idx))
+                scale_shift[idx] = scale_shift[nearest]
 
     if not correspondences:
         print(
