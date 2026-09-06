@@ -15,5 +15,6 @@ workdir*/
 _*.png
 _*.jpg
 run_test*.log
+analyze_run*.log
 
 .claude/

@@ -59,7 +59,14 @@ def recover_scene_geometry(image_dir, workspace_dir, sequential_overlap=10):
     # Video should yield one connected reconstruction; if COLMAP split it into
     # multiple disjoint components, keep the one covering the most frames.
     recon = max(reconstructions.values(), key=lambda r: r.num_reg_images())
+    return geometry_from_reconstruction(recon)
 
+
+def geometry_from_reconstruction(recon):
+    """Extract the same per-frame FrameGeometry dict `recover_scene_geometry`
+    returns, from an already-built pycolmap.Reconstruction. Split out so a
+    saved reconstruction (e.g. workdir/colmap/sparse/<n>) can be reloaded and
+    reused without rerunning SfM -- useful for analysis/comparison scripts."""
     geometry = {}
     for image in recon.images.values():
         if not image.has_pose:

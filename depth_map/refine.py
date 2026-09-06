@@ -18,6 +18,11 @@ MIN_INLIER_CORRESPONDENCES_PER_PAIR = 16
 # handful of correspondences gets the benefit of the doubt.
 MIN_SAMPLES_FOR_RELIABILITY_CHECK = 200
 MIN_EPIPOLAR_INLIER_RATE = 0.5
+# Fraction of each pair's correspondences permanently held out as a
+# validation set (never used for a gradient step) to actually detect
+# overfitting, rather than trusting the training loss curve alone.
+VAL_FRACTION = 0.2
+EARLY_STOP_PATIENCE = 5
 
 
 def _grid_sample_at(field, uv):
@@ -129,16 +134,27 @@ def refine_depth_sequence(
     # moving object, or a bad correspondence/pose. Filtering these out here
     # keeps the consistency loss from being handed contradictory
     # constraints by e.g. a person moving in the foreground.
-    correspondences = []
+    #
+    # For each surviving pair we also carve out a fixed validation subset
+    # (never trained on) and a training mask that excludes those exact
+    # pixels. A first version of this trained on ONE fixed batch of
+    # correspondences for all epochs; the training loss converged nicely,
+    # but disagreement measured on an independently-resampled set of
+    # correspondences from the SAME flow fields got worse, not better --
+    # classic overfitting to the fixed batch rather than learning a
+    # genuinely more self-consistent depth field. Resampling fresh training
+    # points every epoch (below) plus this held-out validation set (used
+    # for early stopping) is the fix.
+    pair_setup = {}
     inlier_counts = [0] * n
     total_counts = [0] * n
     for (i, j), (flow_ij, mask_ij) in flow_results.items():
         if poses[i] is None or poses[j] is None:
             continue
-        sampled = _sample_valid_correspondences(flow_ij, mask_ij, max_correspondences_per_pair)
-        if sampled is None:
+        pool = _sample_valid_correspondences(flow_ij, mask_ij, max_correspondences_per_pair * 2)
+        if pool is None:
             continue
-        uv_i, uv_j = sampled[0].to(device), sampled[1].to(device)
+        uv_i, uv_j = pool[0].to(device), pool[1].to(device)
 
         R_i, t_i, fx_i, fy_i, cx_i, cy_i = poses[i]
         R_j, t_j, fx_j, fy_j, cx_j, cy_j = poses[j]
@@ -151,16 +167,35 @@ def refine_depth_sequence(
         inlier_counts[i] += inlier.sum().item()
         inlier_counts[j] += inlier.sum().item()
 
-        if inlier.sum().item() < MIN_INLIER_CORRESPONDENCES_PER_PAIR:
+        uv_i, uv_j = uv_i[inlier], uv_j[inlier]
+        if uv_i.shape[0] < MIN_INLIER_CORRESPONDENCES_PER_PAIR * 2:
             continue
-        correspondences.append((i, j, uv_i[inlier], uv_j[inlier]))
+
+        m = uv_i.shape[0]
+        n_val = max(MIN_INLIER_CORRESPONDENCES_PER_PAIR, int(m * VAL_FRACTION))
+        perm = torch.randperm(m, device=device)
+        val_idx = perm[:n_val]
+        val_uv_i, val_uv_j = uv_i[val_idx], uv_j[val_idx]
+
+        train_mask = mask_ij.clone()
+        val_y = val_uv_i[:, 1].round().long().cpu()
+        val_x = val_uv_i[:, 0].round().long().cpu()
+        train_mask[val_y, val_x] = False
+
+        pair_setup[(i, j)] = {
+            "E": E,
+            "flow_ij": flow_ij,
+            "train_mask": train_mask,
+            "val_uv_i": val_uv_i,
+            "val_uv_j": val_uv_j,
+        }
 
     # A frame whose correspondences are mostly epipolar outliers is either
     # dominated by a moving subject or was itself badly posed by COLMAP
     # (e.g. registered via a weak fallback rather than normal PnP) --
     # either way its own anchors/pose aren't trustworthy either, so it's
-    # pulled out of the anchor loss and every correspondence touching it,
-    # the same as a frame COLMAP never registered at all.
+    # pulled out of the anchor loss and every pair touching it, the same as
+    # a frame COLMAP never registered at all.
     unreliable_frames = {
         idx
         for idx in range(n)
@@ -175,9 +210,10 @@ def refine_depth_sequence(
         )
         for idx in unreliable_frames:
             anchors[idx] = None
-        correspondences = [
-            c for c in correspondences if c[0] not in unreliable_frames and c[1] not in unreliable_frames
-        ]
+        pair_setup = {
+            (i, j): setup for (i, j), setup in pair_setup.items()
+            if i not in unreliable_frames and j not in unreliable_frames
+        }
 
     # Frames with no anchors -- either COLMAP never registered them, or they
     # were just flagged unreliable above -- were left at the identity
@@ -197,7 +233,7 @@ def refine_depth_sequence(
                 nearest = min(calibrated_idxs, key=lambda c: abs(c - idx))
                 scale_shift[idx] = scale_shift[nearest]
 
-    if not correspondences:
+    if not pair_setup:
         print(
             "[refine] WARNING: no usable cross-frame correspondences "
             "(COLMAP registered too few frames, or flow masks rejected everything) "
@@ -214,7 +250,10 @@ def refine_depth_sequence(
     huber = torch.nn.HuberLoss(delta=HUBER_DELTA_WORLD)
 
     num_anchor_terms = sum(1 for a in anchors if a is not None)
-    num_correspondence_terms = len(correspondences)
+    num_pairs = len(pair_setup)
+    best_val_loss = float("inf")
+    best_state = None
+    epochs_without_improvement = 0
 
     # Every term is backward()'d individually and its (tiny, single-frame or
     # single-pair) graph freed immediately, instead of keeping all n frames'
@@ -242,32 +281,88 @@ def refine_depth_sequence(
             term_loss.backward()
             anchor_loss_total += term_loss.item()
 
-        for i, j, uv_i, uv_j in correspondences:
+        # Fresh random training sample every epoch (drawn from train_mask,
+        # which already excludes this pair's held-out validation pixels) --
+        # not the same fixed batch reused every epoch, which is what
+        # previously let the network overfit to particular pixels instead
+        # of learning a genuinely more self-consistent depth field.
+        for (i, j), setup in pair_setup.items():
+            sampled = _sample_valid_correspondences(setup["flow_ij"], setup["train_mask"], max_correspondences_per_pair)
+            if sampled is None:
+                continue
+            uv_i, uv_j = sampled[0].to(device), sampled[1].to(device)
+            epi_error = epipolar_error_px(uv_i, uv_j, setup["E"], *poses[i][2:], *poses[j][2:])
+            inlier = epi_error < MAX_EPIPOLAR_ERROR_PX
+            if inlier.sum().item() < MIN_INLIER_CORRESPONDENCES_PER_PAIR:
+                continue
+            uv_i, uv_j = uv_i[inlier], uv_j[inlier]
+
             disp_i = depth_model.forward_head(feature_cache[i][0], feature_cache[i][1], out_sizes[i])[0]
             disp_j = depth_model.forward_head(feature_cache[j][0], feature_cache[j][1], out_sizes[j])[0]
             scale_i, shift_i = scale_shift[i]
             scale_j, shift_j = scale_shift[j]
-            R_i, t_i, fx_i, fy_i, cx_i, cy_i = poses[i]
-            R_j, t_j, fx_j, fy_j, cx_j, cy_j = poses[j]
+            R_i, t_i = poses[i][0], poses[i][1]
+            R_j, t_j = poses[j][0], poses[j][1]
 
             depth_i_vals = disparity_to_depth(_grid_sample_at(disp_i, uv_i)[:, 0], scale_i, shift_i)
             depth_j_vals = disparity_to_depth(_grid_sample_at(disp_j, uv_j)[:, 0], scale_j, shift_j)
 
-            p_i_cam = backproject(uv_i, depth_i_vals, fx_i, fy_i, cx_i, cy_i)
-            p_j_cam = backproject(uv_j, depth_j_vals, fx_j, fy_j, cx_j, cy_j)
+            p_i_cam = backproject(uv_i, depth_i_vals, *poses[i][2:])
+            p_j_cam = backproject(uv_j, depth_j_vals, *poses[j][2:])
             p_i_world = (p_i_cam - t_i) @ R_i
             p_j_world = (p_j_cam - t_j) @ R_j
-            term_loss = consistency_weight * huber(p_i_world, p_j_world) / num_correspondence_terms
+            term_loss = consistency_weight * huber(p_i_world, p_j_world) / num_pairs
             term_loss.backward()
             consistency_loss_total += term_loss.item()
 
         optimizer.step()
 
-        if epoch % 10 == 0 or epoch == num_epochs - 1:
-            print(
-                f"[refine] epoch {epoch:4d}  anchor={anchor_loss_total:.4f}  "
-                f"consistency={consistency_loss_total:.4f}"
+        # Validation pass on the permanently held-out pixels, never used for
+        # a gradient step -- this is what actually detects overfitting,
+        # since the training loss above will happily keep decreasing on
+        # whatever it's currently being fed regardless.
+        depth_model.eval_mode()
+        val_loss_total = 0.0
+        with torch.no_grad():
+            for (i, j), setup in pair_setup.items():
+                disp_i = depth_model.forward_head(feature_cache[i][0], feature_cache[i][1], out_sizes[i])[0]
+                disp_j = depth_model.forward_head(feature_cache[j][0], feature_cache[j][1], out_sizes[j])[0]
+                scale_i, shift_i = scale_shift[i]
+                scale_j, shift_j = scale_shift[j]
+                R_i, t_i = poses[i][0], poses[i][1]
+                R_j, t_j = poses[j][0], poses[j][1]
+
+                depth_i_vals = disparity_to_depth(_grid_sample_at(disp_i, setup["val_uv_i"])[:, 0], scale_i, shift_i)
+                depth_j_vals = disparity_to_depth(_grid_sample_at(disp_j, setup["val_uv_j"])[:, 0], scale_j, shift_j)
+                p_i_cam = backproject(setup["val_uv_i"], depth_i_vals, *poses[i][2:])
+                p_j_cam = backproject(setup["val_uv_j"], depth_j_vals, *poses[j][2:])
+                p_i_world = (p_i_cam - t_i) @ R_i
+                p_j_world = (p_j_cam - t_j) @ R_j
+                val_loss_total += huber(p_i_world, p_j_world).item()
+        depth_model.train_mode()
+
+        if val_loss_total < best_val_loss - 1e-6:
+            best_val_loss = val_loss_total
+            best_state = (
+                {k: v.detach().clone() for k, v in depth_model.model.neck.state_dict().items()},
+                {k: v.detach().clone() for k, v in depth_model.model.head.state_dict().items()},
             )
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+
+        print(
+            f"[refine] epoch {epoch:4d}  anchor={anchor_loss_total:.4f}  "
+            f"consistency(train)={consistency_loss_total:.4f}  consistency(val)={val_loss_total:.4f}"
+        )
+
+        if num_pairs and epochs_without_improvement >= EARLY_STOP_PATIENCE:
+            print(f"[refine] early stopping at epoch {epoch} (no validation improvement for {EARLY_STOP_PATIENCE} epochs)")
+            break
+
+    if best_state is not None:
+        depth_model.model.neck.load_state_dict(best_state[0])
+        depth_model.model.head.load_state_dict(best_state[1])
 
     depth_model.eval_mode()
     final_depths = []
