@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Pipeline working directories (frames, COLMAP DB, exported depth) -- regenerable
+workdir*/
+
+# Test/source footage -- personal video, not source code
+*.mov
+*.MOV
+*.mp4
+*.MP4
+
+# Scratch debug/comparison images and run logs from this session
+_*.png
+_*.jpg
+run_test*.log
+
+.claude/
